@@ -4,6 +4,83 @@
   "version": 1,
   "name": "test-framework",
   "kind": "testing",
-  "packages": [],
-  "tests": []
+  "packages": [
+    "hyper-test-report"
+  ],
+  "tests": [
+    [
+      "python3",
+      "-m",
+      "unittest",
+      "discover",
+      "-s",
+      "{component}/tests",
+      "-p",
+      "test_*.py"
+    ]
+  ],
+  "cargo": [
+    {
+      "manifest": "guest/test-report/Cargo.toml",
+      "domain": "system"
+    }
+  ],
+  "artifacts": [
+    {
+      "binary": "hyper-test-report",
+      "staged": "test-report",
+      "destination": "bin/test-report",
+      "mode": "0755",
+      "profiles": [
+        "development"
+      ],
+      "rust_runtime": "std",
+      "environment": "system",
+      "manifest": "guest/test-report/Cargo.toml",
+      "enabled": false
+    }
+  ],
+  "workspace": {
+    "pythonpath": [
+      "python"
+    ]
+  },
+  "test_requires_rust": true,
+  "build": {
+    "requires": [
+      "toolchain"
+    ],
+    "actions": {
+      "all": [
+        [
+          "python3",
+          "{workspace}/scripts/build-native-module.py",
+          "--module",
+          "{module}",
+          "--action",
+          "{action}"
+        ]
+      ],
+      "build": [
+        [
+          "python3",
+          "{workspace}/scripts/build-native-module.py",
+          "--module",
+          "{module}",
+          "--action",
+          "{action}"
+        ]
+      ],
+      "check": [
+        [
+          "python3",
+          "{workspace}/scripts/build-native-module.py",
+          "--module",
+          "{module}",
+          "--action",
+          "{action}"
+        ]
+      ]
+    }
+  }
 }
