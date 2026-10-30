@@ -33,3 +33,7 @@ The Python API is provided by `python/hyper_test`; `make prepare` adds it to the
 execution view's Python path. Guest protocol sources live under `guest/test-report`.
 Framework self-tests run without a full emulator boot. System cases are explicit
 manual acceptance work and never start automatically from a module PR.
+
+Performance and hardware reports use `hyper_test.provenance.source_inventory` to
+record the workspace identity and every component revision/dirty state. This also
+works from generated execution directories and exported sources without Git.
