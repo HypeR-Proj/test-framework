@@ -4,9 +4,6 @@
   "version": 1,
   "name": "test-framework",
   "kind": "testing",
-  "packages": [
-    "hyper-test-report"
-  ],
   "tests": [
     [
       "python3",
@@ -47,40 +44,9 @@
   },
   "test_requires_rust": true,
   "build": {
+    "type": "native-rust",
     "requires": [
       "toolchain"
-    ],
-    "actions": {
-      "all": [
-        [
-          "python3",
-          "{workspace}/scripts/build-native-module.py",
-          "--module",
-          "{module}",
-          "--action",
-          "{action}"
-        ]
-      ],
-      "build": [
-        [
-          "python3",
-          "{workspace}/scripts/build-native-module.py",
-          "--module",
-          "{module}",
-          "--action",
-          "{action}"
-        ]
-      ],
-      "check": [
-        [
-          "python3",
-          "{workspace}/scripts/build-native-module.py",
-          "--module",
-          "{module}",
-          "--action",
-          "{action}"
-        ]
-      ]
-    }
+    ]
   }
 }
