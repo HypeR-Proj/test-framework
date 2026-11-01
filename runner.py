@@ -13,7 +13,7 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / 'python'))
-sys.path.insert(0, str(HERE.parent / 'scripts'))
+sys.path.insert(0, str((HERE.parent / 'project.py').resolve().parent / 'scripts'))
 
 from hyper_test.runner import discover, execute, matrix
 from buildsystem.model import discover as modules, relative
