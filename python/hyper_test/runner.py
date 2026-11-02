@@ -6,12 +6,15 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import glob
 import os
 from pathlib import Path
 import re
 import signal
+import shutil
 import subprocess
 import time
+import tempfile
 
 NAME = re.compile(r'[a-z0-9][a-z0-9-]*\Z')
 
@@ -37,6 +40,7 @@ class Case:
     command: list
     environment: dict
     timeout: int
+    batch: str = ''
 
     def matrix(self):
         return {'id': self.id, 'arch': self.arch, 'fixture': self.fixture}
@@ -79,7 +83,14 @@ def discover(directory, fixtures):
                     raise ValueError(f'{name}: invalid environment')
                 if key in cases:
                     raise ValueError(f'duplicate case: {key}')
-                cases[key] = Case(key, name, arch, fixture, args, environment, timeout)
+                batch = variant.get('batch', data.get('batch', ''))
+                if isinstance(batch, dict):
+                    if set(batch) != set(architectures):
+                        raise ValueError(f'{name}: batch map must cover exactly the case architectures')
+                    batch = batch[arch]
+                if batch != '':
+                    identifier(batch)
+                cases[key] = Case(key, name, arch, fixture, args, environment, timeout, batch)
     if not cases:
         raise ValueError('system acceptance has no cases')
     for name, fixture in available.items():
@@ -93,12 +104,36 @@ def discover(directory, fixtures):
         for key, value in fixture.get('environment', {}).items():
             if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key) or not isinstance(value, str):
                 raise ValueError(f'{name}: invalid fixture environment')
+    batches(cases)  # Reject ambiguous or incompatible execution groups early.
     return cases, available
+
+
+def batches(cases):
+    groups = {}
+    for case in cases.values():
+        key = f'batch-{case.batch}-{case.arch}' if case.batch else case.id
+        if case.batch and key in cases:
+            raise ValueError(f'batch identifier collides with a case: {key}')
+        group = groups.setdefault(key, [])
+        if group and (group[0].arch, group[0].fixture) != (case.arch, case.fixture):
+            raise ValueError(f'{key}: batch cases must share architecture and fixture')
+        group.append(case)
+    return groups
+
+
+def select(cases, name, arch=None):
+    groups = batches(cases)
+    selected = ([cases[name]] if name in cases else
+                groups.get(name, [case for case in cases.values() if case.name == name]))
+    return [case for case in selected if arch is None or case.arch == arch]
 
 
 def matrix(cases):
     fixtures = sorted({(case.fixture, case.arch) for case in cases.values() if case.fixture})
-    return {'cases': {'include': [case.matrix() for case in cases.values()]},
+    groups = batches(cases)
+    return {'cases': {'include': [dict(group[0].matrix(), id=name,
+                                     members=[case.id for case in group])
+                                  for name, group in groups.items()]},
             'fixtures': {'include': [{'id': name + '-' + arch, 'name': name, 'arch': arch}
                                      for name, arch in fixtures]}}
 
@@ -119,12 +154,69 @@ def terminate(process):
     process.wait()
 
 
-def execute(name, arguments, workspace, output, environment, timeout):
+def diagnostic_snapshot(patterns, root):
+    root = root.resolve()
+    found = {}
+    for pattern in patterns:
+        for filename in glob.iglob(pattern, recursive=True):
+            path = Path(filename)
+            if not path.is_file():
+                continue
+            resolved = path.resolve()
+            if not resolved.is_relative_to(root):
+                raise ValueError(f'diagnostic escapes the output directory: {path}')
+            info = resolved.stat()
+            found[resolved] = (info.st_dev, info.st_ino, info.st_size,
+                               info.st_mtime_ns, info.st_ctime_ns)
+    return found
+
+
+def preserve_diagnostics(name, patterns, before, output):
+    changed = [path for path, stamp in diagnostic_snapshot(patterns, output.parent).items()
+               if before.get(path) != stamp]
+    if not changed:
+        return []
+    directory = output / 'diagnostics'
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = Path(tempfile.mkdtemp(prefix=name + '-', dir=directory))
+    saved = []
+    for path in sorted(changed):
+        copy = destination / path.relative_to(output.parent.resolve())
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, copy)
+        saved.append(str(copy.relative_to(output.parent)))
+    return saved
+
+
+def execute_cases(selected, fixtures, workspace, output, environment, diagnostics=()):
+    records = []
+    for case in selected:
+        fixture = output / 'fixtures' / f'{case.fixture}-{case.arch}'
+        values = {'workspace': str(workspace), 'out': str(output), 'arch': case.arch,
+                  'fixture': str(fixture)}
+        # Each case gets a fresh environment; QEMU topology and fault controls
+        # must not leak from an earlier member sharing this build directory.
+        env = {**environment, **case.environment, 'CI_ARCH': case.arch}
+        if case.fixture and env.get('CI_REQUIRE_FIXTURES') == '1' and not fixture.is_dir():
+            raise ValueError(f'{case.id}: required fixture was not downloaded: {fixture}')
+        if case.fixture and fixture.is_dir():
+            env.update(fixtures[case.fixture].get('environment', {}))
+            env['CI_NATIVE_FIXTURE'] = str(fixture)
+        command = [value.format_map(values) for value in case.command]
+        records.append(execute(case.id, command, workspace, output / 'results', env,
+                               case.timeout, [p.format_map(values) for p in diagnostics]))
+    return records
+
+
+def execute(name, arguments, workspace, output, environment, timeout, diagnostics=()):
+    output = Path(output).resolve()
     started = time.monotonic()
     record = {'id': name, 'started': datetime.now(timezone.utc).isoformat(), 'command': arguments,
               'status': 'error', 'returncode': None}
     process = None
+    before = {}
     try:
+        before = diagnostic_snapshot(diagnostics, output.parent)
         print(f'Running {name}', flush=True)
         process = subprocess.Popen(arguments, cwd=workspace, env=environment, start_new_session=True)
         try:
@@ -137,6 +229,12 @@ def execute(name, arguments, workspace, output, environment, timeout):
         if process is not None:
             terminate(process)
         record['duration_seconds'] = round(time.monotonic() - started, 3)
+        try:
+            if diagnostics:
+                record['diagnostics'] = preserve_diagnostics(name, diagnostics, before, output)
+        except (OSError, ValueError) as error:
+            record['status'] = 'error'
+            record['diagnostic_error'] = str(error)
         output.mkdir(parents=True, exist_ok=True)
         path = output / (identifier(name) + '.json')
         temporary = path.with_suffix('.json.tmp')
