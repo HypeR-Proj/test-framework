@@ -23,6 +23,23 @@ case and fixture matrix; GitHub Actions consumes the same matrix as local runs.
 Every execution records a JSON result, elapsed time and log under OUT/results.
 Timeouts terminate the process group, including descendant emulators.
 
+Cases may declare `batch` as a name or an architecture-to-name map. Cases in a
+batch share one worker and build output, execute sequentially, and must use the
+same architecture and fixture. `list` emits one matrix row per batch, including
+its complete `members` list. `run batch-NAME-ARCH` executes that row; individual
+case IDs and case names remain available for local reproduction. Case failures
+are recorded independently, later members still run, and any failure fails the
+batch. Environments and process groups are isolated between members; only build
+artifacts are reused. A batch must not rely on an earlier case running first.
+
+The registry owner's `workspace.system_tests.diagnostics` may list glob patterns
+using `{workspace}`, `{out}` and `{arch}`. Files must resolve inside OUT. Changed
+diagnostics are copied after each case into unique directories beneath
+`OUT/results/diagnostics/`, before another case can overwrite a shared log path.
+Each case result lists its saved paths. CI must retain the complete results tree,
+including command transcripts and failure records. Patterns should target runtime
+output directories rather than traverse compiler caches.
+
 Fixtures are built once per source/configuration/architecture identity. Consumers
 verify identity and payload hashes before use, then create disposable disks as
 needed. CI sets `CI_REQUIRE_FIXTURES=1` so a missing download fails instead of

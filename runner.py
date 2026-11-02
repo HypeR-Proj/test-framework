@@ -15,7 +15,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / 'python'))
 sys.path.insert(0, str((HERE.parent / 'project.py').resolve().parent / 'scripts'))
 
-from hyper_test.runner import discover, execute, matrix
+from hyper_test.runner import batches, discover, execute, execute_cases, matrix, select
 from buildsystem.model import discover as modules, relative
 
 
@@ -35,11 +35,15 @@ def main():
     registry = owner.metadata['workspace']['system_tests']
     cases, fixtures = discover(owner.source / relative(registry['cases']),
                                owner.source / relative(registry['fixtures']))
+    diagnostics = registry.get('diagnostics', [])
+    if not isinstance(diagnostics, list) or any(not isinstance(p, str) or '\0' in p for p in diagnostics):
+        raise ValueError('system-test diagnostics must be an array of glob patterns')
     if args.action == 'list':
         print(json.dumps(matrix(cases), separators=(',', ':')))
         return
     if args.action == 'run' and args.arch is None:
-        args.arch = cases[args.name].arch if args.name in cases else os.environ.get('ARCH', 'aarch64')
+        group = [cases[args.name]] if args.name in cases else batches(cases).get(args.name)
+        args.arch = group[0].arch if group else os.environ.get('ARCH', 'aarch64')
     if not os.environ.get('HYPER_BUILD_VIEW'):
         command = [sys.executable, str(root / 'project.py'), '--workspace', str(root)]
         if args.out:
@@ -65,23 +69,13 @@ def main():
         if record['status'] != 'passed':
             raise ValueError('fixture construction failed')
         return
-    selected = [case for case in cases.values() if (args.name in (case.id, case.name))
-                and (args.arch is None or args.arch == case.arch)]
+    selected = select(cases, args.name, args.arch)
     if not selected:
         raise ValueError('no matching system case; use list to inspect available names')
-    for case in selected:
-        fixture = output / 'fixtures' / f'{case.fixture}-{case.arch}'
-        values = {'workspace': str(root), 'out': str(output), 'arch': case.arch, 'fixture': str(fixture)}
-        environment = {**os.environ, **case.environment, 'CI_ARCH': case.arch}
-        if case.fixture and os.environ.get('CI_REQUIRE_FIXTURES') == '1' and not fixture.is_dir():
-            raise ValueError(f'{case.id}: required fixture was not downloaded: {fixture}')
-        if case.fixture and fixture.is_dir():
-            environment.update(fixtures[case.fixture].get('environment', {}))
-            environment['CI_NATIVE_FIXTURE'] = str(fixture)
-        command = [value.format_map(values) for value in case.command]
-        record = execute(case.id, command, root, output / 'results', environment, case.timeout)
-        if record['status'] != 'passed':
-            raise ValueError(f'{case.id}: {record["status"]}')
+    records = execute_cases(selected, fixtures, root, output, dict(os.environ), diagnostics)
+    failed = [record['id'] for record in records if record['status'] != 'passed']
+    if failed:
+        raise ValueError('failed system cases: ' + ', '.join(failed))
 
 
 if __name__ == '__main__':
