@@ -20,8 +20,14 @@ make test MODULE=test-framework
 
 The runner discovers the registry owner from module metadata. `list` emits a
 case and fixture matrix; GitHub Actions consumes the same matrix as local runs.
-Every execution records a JSON result, elapsed time and log under OUT/results.
-Timeouts terminate the process group, including descendant emulators.
+Every execution records a JSON result, elapsed time and separate binary stdout
+and stderr logs under OUT/results. Output is also relayed to the live console.
+The result's `stdout` and `stderr` paths are relative to OUT and use a unique
+directory for each attempt; rerunning a case does not overwrite its transcripts.
+`CASE.json` describes the most recent attempt. Failures include `failure_stage`
+and `failure_reason`, distinguishing preparation, launch, execution and evidence
+collection. Nonzero exits retain their return code. Timeouts retain partial
+output and terminate the process group, including descendant emulators.
 
 Cases may declare `batch` as a name or an architecture-to-name map. Cases in a
 batch share one worker and build output, execute sequentially, and must use the
@@ -31,6 +37,11 @@ case IDs and case names remain available for local reproduction. Case failures
 are recorded independently, later members still run, and any failure fails the
 batch. Environments and process groups are isolated between members; only build
 artifacts are reused. A batch must not rely on an earlier case running first.
+Missing executables and case-local preparation errors also produce records and
+allow later cases to run. User interruption records `interrupted`, cleans up the
+owned process group and stops the batch. Missing required shared fixtures record
+a `fixture` failure and stop the batch; unusable result storage or failed process
+cleanup also aborts, because the runner cannot safely isolate later cases.
 
 The registry owner's `workspace.system_tests.diagnostics` may list glob patterns
 using `{workspace}`, `{out}` and `{arch}`. Files must resolve inside OUT. Changed

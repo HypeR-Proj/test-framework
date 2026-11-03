@@ -5,6 +5,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from contextlib import ExitStack
 import json
 import glob
 import os
@@ -13,6 +14,7 @@ import re
 import signal
 import shutil
 import subprocess
+import sys
 import time
 import tempfile
 
@@ -142,7 +144,7 @@ def terminate(process):
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
-        return
+        pass
     try:
         process.wait(timeout=3)
     except subprocess.TimeoutExpired:
@@ -198,46 +200,127 @@ def execute_cases(selected, fixtures, workspace, output, environment, diagnostic
         # must not leak from an earlier member sharing this build directory.
         env = {**environment, **case.environment, 'CI_ARCH': case.arch}
         if case.fixture and env.get('CI_REQUIRE_FIXTURES') == '1' and not fixture.is_dir():
-            raise ValueError(f'{case.id}: required fixture was not downloaded: {fixture}')
+            reason = f'{case.id}: required fixture was not downloaded: {fixture}'
+            execute(case.id, case.command, workspace, output / 'results', env,
+                    case.timeout, preparation_failure=('fixture', reason))
+            raise ValueError(reason)
         if case.fixture and fixture.is_dir():
             env.update(fixtures[case.fixture].get('environment', {}))
             env['CI_NATIVE_FIXTURE'] = str(fixture)
-        command = [value.format_map(values) for value in case.command]
+        try:
+            command = [value.format_map(values) for value in case.command]
+            patterns = [p.format_map(values) for p in diagnostics]
+        except (KeyError, ValueError) as error:
+            records.append(execute(case.id, case.command, workspace, output / 'results', env,
+                                   case.timeout, preparation_failure=('prepare', str(error))))
+            continue
         records.append(execute(case.id, command, workspace, output / 'results', env,
-                               case.timeout, [p.format_map(values) for p in diagnostics]))
+                               case.timeout, patterns))
     return records
 
 
-def execute(name, arguments, workspace, output, environment, timeout, diagnostics=()):
+def relay_output(streams):
+    # Children write directly to regular files: no pipe capacity or reader thread
+    # can hold process cleanup hostage. Bound each live-console pass for fairness.
+    copied = False
+    for source, console in streams:
+        data = source.read(65536)
+        if data:
+            copied = True
+            binary = getattr(console, 'buffer', None)
+            if binary is not None:
+                binary.write(data)
+                binary.flush()
+            else:
+                console.write(data.decode('utf-8', errors='replace'))
+                console.flush()
+    return copied
+
+
+def execute(name, arguments, workspace, output, environment, timeout, diagnostics=(),
+            preparation_failure=None):
+    identifier(name)
     output = Path(output).resolve()
     started = time.monotonic()
     record = {'id': name, 'started': datetime.now(timezone.utc).isoformat(), 'command': arguments,
               'status': 'error', 'returncode': None}
     process = None
-    before = {}
-    try:
-        before = diagnostic_snapshot(diagnostics, output.parent)
-        print(f'Running {name}', flush=True)
-        process = subprocess.Popen(arguments, cwd=workspace, env=environment, start_new_session=True)
+    before = None
+    # An unusable results directory is a shared infrastructure failure. Do not
+    # continue a batch that cannot durably record which cases were attempted.
+    output.mkdir(parents=True, exist_ok=True)
+    logs = output / 'logs'
+    logs.mkdir(exist_ok=True)
+    transcript = Path(tempfile.mkdtemp(prefix=name + '-', dir=logs))
+    with ExitStack() as files:
+        writers = []
+        streams = []
+        for channel, console in (('stdout', sys.stdout), ('stderr', sys.stderr)):
+            path = transcript / (channel + '.log')
+            writers.append(files.enter_context(path.open('wb', buffering=0)))
+            streams.append((files.enter_context(path.open('rb', buffering=0)), console))
+            record[channel] = str(path.relative_to(output.parent))
+        stage = 'prepare'
         try:
-            record['returncode'] = process.wait(timeout=timeout)
-            record['status'] = 'passed' if record['returncode'] == 0 else 'failed'
-        except subprocess.TimeoutExpired:
-            record['status'] = 'timeout'
-        return record
-    finally:
-        if process is not None:
-            terminate(process)
-        record['duration_seconds'] = round(time.monotonic() - started, 3)
-        try:
-            if diagnostics:
-                record['diagnostics'] = preserve_diagnostics(name, diagnostics, before, output)
+            if preparation_failure is not None:
+                stage, reason = preparation_failure
+                raise ValueError(reason)
+            before = diagnostic_snapshot(diagnostics, output.parent)
+            print(f'Running {name}', flush=True)
+            stage = 'launch'
+            process = subprocess.Popen(arguments, cwd=workspace, env=environment,
+                                       start_new_session=True, stdout=writers[0], stderr=writers[1])
+            stage = 'run'
+            deadline = time.monotonic() + timeout
+            while True:
+                relay_output(streams)
+                remaining = deadline - time.monotonic()
+                if process.poll() is not None:
+                    record['returncode'] = process.returncode
+                    record['status'] = 'passed' if process.returncode == 0 else 'failed'
+                    if process.returncode != 0:
+                        record.update(failure_stage=stage, failure_reason=f'exit status {process.returncode}')
+                    break
+                if remaining <= 0:
+                    record.update(status='timeout', failure_stage=stage,
+                                  failure_reason=f'exceeded {timeout} seconds')
+                    break
+                try:
+                    process.wait(timeout=min(0.1, remaining))
+                except subprocess.TimeoutExpired:
+                    pass
+        except KeyboardInterrupt:
+            record.update(status='interrupted', failure_stage=stage, failure_reason='user interruption')
+            raise
         except (OSError, ValueError) as error:
-            record['status'] = 'error'
-            record['diagnostic_error'] = str(error)
-        output.mkdir(parents=True, exist_ok=True)
-        path = output / (identifier(name) + '.json')
-        temporary = path.with_suffix('.json.tmp')
-        temporary.write_text(json.dumps(record, indent=2) + '\n')
-        temporary.replace(path)
-        print(f'{name}: {record["status"]}, {record["duration_seconds"]:.3f}s', flush=True)
+            record.update(status='error', failure_stage=stage, failure_reason=str(error))
+        finally:
+            cleaned = False
+            try:
+                if process is not None:
+                    terminate(process)
+                cleaned = True
+            except OSError as error:
+                record['cleanup_error'] = str(error)
+                if record['status'] != 'interrupted':
+                    record.update(status='error', failure_stage='cleanup', failure_reason=str(error))
+                # A failed cleanup can leave an owned process behind. Abort the
+                # batch after recording evidence rather than run another case.
+                raise
+            finally:
+                try:
+                    while cleaned and relay_output(streams):
+                        pass
+                    if diagnostics and before is not None:
+                        record['diagnostics'] = preserve_diagnostics(name, diagnostics, before, output)
+                except (OSError, ValueError) as error:
+                    record['evidence_error'] = str(error)
+                    if record['status'] not in ('error', 'interrupted'):
+                        record.update(status='error', failure_stage='evidence', failure_reason=str(error))
+                record['duration_seconds'] = round(time.monotonic() - started, 3)
+                path = output / (name + '.json')
+                temporary = path.with_suffix('.json.tmp')
+                temporary.write_text(json.dumps(record, indent=2) + '\n')
+                temporary.replace(path)
+                print(f'{name}: {record["status"]}, {record["duration_seconds"]:.3f}s', flush=True)
+    return record
