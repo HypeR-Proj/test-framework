@@ -141,19 +141,28 @@ def matrix(cases):
 
 
 def terminate(process):
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
+    interrupted = False
+    while True:
+        try:
+            try:
+                os.killpg(process.pid, signal.SIGKILL if interrupted else signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            if not interrupted:
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            return interrupted
+        except KeyboardInterrupt:
+            # Preserve the interruption, but finish killing and reaping owned
+            # processes before allowing it to abort the batch.
+            interrupted = True
 
 
 def diagnostic_snapshot(patterns, root):
@@ -296,9 +305,13 @@ def execute(name, arguments, workspace, output, environment, timeout, diagnostic
             record.update(status='error', failure_stage=stage, failure_reason=str(error))
         finally:
             cleaned = False
+            cleanup_interrupted = False
             try:
                 if process is not None:
-                    terminate(process)
+                    cleanup_interrupted = terminate(process)
+                    if cleanup_interrupted:
+                        record.update(status='interrupted', failure_stage='cleanup',
+                                      failure_reason='user interruption')
                 cleaned = True
             except OSError as error:
                 record['cleanup_error'] = str(error)
@@ -317,10 +330,23 @@ def execute(name, arguments, workspace, output, environment, timeout, diagnostic
                     record['evidence_error'] = str(error)
                     if record['status'] not in ('error', 'interrupted'):
                         record.update(status='error', failure_stage='evidence', failure_reason=str(error))
-                record['duration_seconds'] = round(time.monotonic() - started, 3)
-                path = output / (name + '.json')
-                temporary = path.with_suffix('.json.tmp')
-                temporary.write_text(json.dumps(record, indent=2) + '\n')
-                temporary.replace(path)
+                except KeyboardInterrupt:
+                    cleanup_interrupted = True
+                    record.update(status='interrupted', failure_stage='evidence',
+                                  failure_reason='user interruption')
+                while True:
+                    try:
+                        record['duration_seconds'] = round(time.monotonic() - started, 3)
+                        path = output / (name + '.json')
+                        temporary = path.with_suffix('.json.tmp')
+                        temporary.write_text(json.dumps(record, indent=2) + '\n')
+                        temporary.replace(path)
+                        break
+                    except KeyboardInterrupt:
+                        cleanup_interrupted = True
+                        record.update(status='interrupted', failure_stage='evidence',
+                                      failure_reason='user interruption')
                 print(f'{name}: {record["status"]}, {record["duration_seconds"]:.3f}s', flush=True)
+            if cleanup_interrupted:
+                raise KeyboardInterrupt
     return record

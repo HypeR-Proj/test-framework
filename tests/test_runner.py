@@ -238,6 +238,34 @@ time.sleep(60)
             self.assertEqual(record['failure_stage'], 'cleanup')
             self.assertFalse((root / 'results/later.json').exists())
 
+    def test_interruption_during_cleanup_is_recorded_after_reaping(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cases = [Case(name, name, 'aarch64', '', [sys.executable, '-c', 'pass'], {}, 10)
+                     for name in ('first', 'later')]
+
+            def interrupted_cleanup(process):
+                original_wait = process.wait
+                interrupted = False
+
+                def wait(*args, **kwargs):
+                    nonlocal interrupted
+                    if not interrupted:
+                        interrupted = True
+                        raise KeyboardInterrupt
+                    return original_wait(*args, **kwargs)
+
+                with patch.object(process, 'wait', side_effect=wait):
+                    return terminate(process)
+
+            with patch('hyper_test.runner.terminate', side_effect=interrupted_cleanup):
+                with self.assertRaises(KeyboardInterrupt):
+                    execute_cases(cases, {}, root, root, dict(os.environ))
+            record = json.loads((root / 'results/first.json').read_text())
+            self.assertEqual(record['status'], 'interrupted')
+            self.assertEqual(record['failure_stage'], 'cleanup')
+            self.assertFalse((root / 'results/later.json').exists())
+
     def test_interruption_saves_evidence_and_stops_batch(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
